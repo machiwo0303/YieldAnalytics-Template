@@ -1,0 +1,77 @@
+name: ① データ取得（手動実行）
+
+# 手動実行のみ。定期実行（schedule）は設定していません。
+on:
+  workflow_dispatch:
+    inputs:
+      input_csv:
+        description: "銘柄コード一覧のCSV"
+        required: false
+        default: "input/jpx_all.csv"
+
+# 結果をこのリポジトリにコミットするために必要な権限
+permissions:
+  contents: write
+
+# ①と②が同時に動いて、コミットがぶつからないようにする
+concurrency:
+  group: yieldanalytics-run
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 全銘柄を順番に取得するため長めに設定（上限は360分）
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run jpx_screening_fetch.py
+        env:
+          INPUT_CSV: ${{ inputs.input_csv }}
+        run: python jpx_screening_fetch.py "$INPUT_CSV"
+
+      - name: Sanity check
+        # 取得にほぼ失敗していた場合（ネットワーク不調・アクセス制限など）は、
+        # 古い結果を上書きしないよう、ここで止める
+        run: |
+          python - <<'PY'
+          import sys
+          import pandas as pd
+
+          df = pd.read_csv("output_financial_dividend_merged.csv")
+          ok = df.groupby("Symbol")["MarketCap"].apply(lambda s: s.notna().any())
+          rate = ok.mean()
+          msg = f"銘柄数 {ok.size} / 時価総額を取得できた銘柄 {int(ok.sum())} ({rate:.1%})"
+          print(msg)
+          with open("summary.md", "w", encoding="utf-8") as f:
+              f.write("### データ取得の結果\n\n" + msg + "\n")
+          if rate < 0.9:
+              print("::error::取得できた銘柄が少なすぎます。時間をおいて再実行してください。")
+              sys.exit(1)
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit result
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          mv output_financial_dividend_merged.csv output/output_financial_dividend_merged.csv
+          git add output/output_financial_dividend_merged.csv
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Update fetch output (manual)"
+            git pull --rebase
+            git push
+          fi

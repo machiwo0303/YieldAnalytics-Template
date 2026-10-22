@@ -1,0 +1,108 @@
+name: ② スコアリングと絞り込み（手動実行）
+
+# 手動実行のみ。定期実行（schedule）は設定していません。
+# 先に「① データ取得」を実行して、output/output_financial_dividend_merged.csv を作っておいてください。
+on:
+  workflow_dispatch:
+    inputs:
+      score_min:
+        description: "総合スコアの下限（0〜100）"
+        required: false
+        default: "75"
+      growth_min:
+        description: "増配率枠の平均増配率の下限（0.25 = 25%）"
+        required: false
+        default: "0.25"
+      watch_max:
+        description: "ウォッチリストの上限件数"
+        required: false
+        default: "100"
+      pick_n:
+        description: "今月の買い時の件数"
+        required: false
+        default: "10"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yieldanalytics-run
+  cancel-in-progress: false
+
+jobs:
+  scoring_filter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check fetch result exists
+        run: |
+          if [ ! -f output/output_financial_dividend_merged.csv ]; then
+            echo "::error::output/output_financial_dividend_merged.csv がありません。先に「① データ取得」を実行してください。"
+            exit 1
+          fi
+
+      - name: Run scoring engine
+        run: |
+          cp output/output_financial_dividend_merged.csv .
+          python jpx_scoring_engine.py
+
+      - name: Run yield filter
+        env:
+          SCORE_MIN: ${{ inputs.score_min }}
+          GROWTH_MIN: ${{ inputs.growth_min }}
+          WATCH_MAX: ${{ inputs.watch_max }}
+          PICK_N: ${{ inputs.pick_n }}
+        run: python jpx_yield_filter.py "$SCORE_MIN" "$GROWTH_MIN" "$WATCH_MAX" "$PICK_N"
+
+      - name: Run make prompt
+        # ウォッチリストや今月の買い時が0件のときは、プロンプトは作らず「No data.」のままにする
+        run: |
+          echo "No data." > prompt_output.txt
+          python makeprompt.py yield_filtered_output.csv || echo "プロンプトの対象がありませんでした"
+
+      - name: Summary
+        run: |
+          python - <<'PY'
+          import os
+          import pandas as pd
+
+          df = pd.read_csv("yield_filtered_output.csv")
+          picks = int((df["MonthlyPick"] == "Y").sum()) if "MonthlyPick" in df.columns else 0
+          text = (
+              "### 絞り込みの結果\n\n"
+              f"- ウォッチリスト：{len(df)}件\n"
+              f"- 今月の買い時：{picks}件\n"
+          )
+          print(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(text)
+          PY
+
+      - name: Commit result
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          mv scored_output.csv output/weekly_scored_output.csv
+          mv yield_filtered_output.csv output/weekly_filtered_output.csv
+          mv prompt_output.txt output/weekly_prompt_output.txt
+          git add output/weekly_scored_output.csv output/weekly_filtered_output.csv output/weekly_prompt_output.txt
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Scoring/filter update (manual)"
+            git pull --rebase
+            git push
+          fi
